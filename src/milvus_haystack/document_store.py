@@ -264,11 +264,16 @@ class MilvusDocumentStore:
         if self._cache_key == current_key and self._col_cache is not None:
             return self._col_cache
         if self._collection_exists():
+            orm_alias = self.alias
             # Since pymilvus 2.6.x, MilvusClient no longer registers its connection with the ORM
-            # `connections` registry; register its handler so `Collection` can find the connection.
+            # `connections` registry, and clients of the same server share one handler and alias whatever
+            # their database. Register a per-database alias so `Collection` reads from this store's database.
             if hasattr(connections, "_alias_handlers"):
-                connections._alias_handlers.setdefault(self.alias, self.client._get_connection())
-            self._col_cache = Collection(self.collection_name, using=self.alias)
+                db_name = getattr(getattr(self.client, "_config", None), "db_name", "") or "default"
+                orm_alias = f"{self.alias}:{db_name}"
+                connections._alias_handlers.setdefault(orm_alias, self.client._get_connection())
+                connections._alias_config.setdefault(orm_alias, {"db_name": db_name})
+            self._col_cache = Collection(self.collection_name, using=orm_alias)
             self._cache_key = current_key
             return self._col_cache
         return None

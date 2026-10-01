@@ -150,3 +150,27 @@ class TestPymilvusApiUsage:
         document_store.filter_documents()
 
         assert calls == []
+
+    @pytest.mark.filterwarnings(r"ignore:.*will be removed in PyMilvus 3\.1")
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_col_uses_configured_database(self):
+        db_name = "haystack_col_db_test"
+        admin = pymilvus.MilvusClient(**DEFAULT_CONNECTION_ARGS)
+        if db_name not in admin.list_databases():
+            admin.create_database(db_name)
+        try:
+            document_store = MilvusDocumentStore(
+                connection_args={**DEFAULT_CONNECTION_ARGS, "db_name": db_name},
+                collection_name="ColDatabaseTest",
+                drop_old=True,
+            )
+            document_store.write_documents([Document(content="test doc", embedding=[0.1, 0.2, 0.3, 0.4])])
+
+            col = document_store.col
+
+            assert col is not None
+            assert col.num_entities >= 0
+        finally:
+            # Not `admin.use_database()`: on pymilvus 2.5 it switches the connection shared with other tests.
+            pymilvus.MilvusClient(**{**DEFAULT_CONNECTION_ARGS, "db_name": db_name}).drop_collection("ColDatabaseTest")
+            admin.drop_database(db_name)
