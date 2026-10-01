@@ -1,11 +1,13 @@
 import logging
 
+import pymilvus
 import pytest
 from haystack import Document
 from haystack.document_stores.types import DocumentStore
 from haystack.testing.document_store import CountDocumentsTest, DeleteDocumentsTest, WriteDocumentsTest
 
 from src.milvus_haystack import MilvusDocumentStore
+from src.milvus_haystack.document_store import MilvusStoreError
 
 logger = logging.getLogger(__name__)
 
@@ -93,3 +95,58 @@ class TestDocumentStore(CountDocumentsTest, WriteDocumentsTest, DeleteDocumentsT
                         assert v == func_reconstructed.to_dict()[k]
             else:
                 assert getattr(reconstructed_document_store, field) == getattr(document_store, field)
+
+
+class TestPymilvusApiUsage:
+    @pytest.fixture
+    def document_store(self) -> MilvusDocumentStore:
+        return MilvusDocumentStore(
+            connection_args=DEFAULT_CONNECTION_ARGS,
+            consistency_level="Strong",
+            index_params={"index_type": "HNSW", "metric_type": "COSINE", "params": {"M": 8, "efConstruction": 64}},
+            drop_old=True,
+        )
+
+    def test_get_index_before_and_after_collection_creation(self, document_store: MilvusDocumentStore):
+        assert document_store._get_index() is None
+
+        document_store.write_documents([Document(content="test doc", embedding=[0.1, 0.2, 0.3, 0.4])])
+
+        index = document_store._get_index()
+        assert index is not None
+        assert index["index_type"] == "HNSW"
+        assert index["metric_type"] == "COSINE"
+        assert document_store.search_params == {"metric_type": "COSINE", "params": {"ef": 10}}
+
+    @pytest.mark.filterwarnings(r"ignore:.*will be removed in PyMilvus 3\.1")
+    def test_col_is_deprecated(self, document_store: MilvusDocumentStore):
+        document_store.write_documents([Document(content="test doc", embedding=[0.1, 0.2, 0.3, 0.4])])
+
+        with pytest.warns(DeprecationWarning, match="client"):
+            col = document_store.col
+
+        assert col is not None
+        assert col.name == document_store.collection_name
+
+    def test_col_raises_without_orm_api(self, document_store: MilvusDocumentStore, monkeypatch):
+        # Simulates pymilvus 3.1, which removes the ORM `Collection` API.
+        monkeypatch.delattr(pymilvus, "Collection")
+
+        with pytest.warns(DeprecationWarning), pytest.raises(MilvusStoreError, match="client"):
+            _ = document_store.col
+
+    def test_collection_existence_is_cached_after_creation(self, document_store: MilvusDocumentStore, monkeypatch):
+        document_store.write_documents([Document(content="test doc", embedding=[0.1, 0.2, 0.3, 0.4])])
+
+        calls = []
+        has_collection = document_store.client.has_collection
+
+        def spy(*args, **kwargs):
+            calls.append(args)
+            return has_collection(*args, **kwargs)
+
+        monkeypatch.setattr(document_store.client, "has_collection", spy)
+        document_store.count_documents()
+        document_store.filter_documents()
+
+        assert calls == []

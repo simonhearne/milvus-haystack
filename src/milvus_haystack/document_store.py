@@ -1,5 +1,6 @@
 import importlib
 import logging
+import warnings
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union
 
@@ -11,14 +12,12 @@ from haystack.errors import FilterError
 from haystack.utils import Secret, deserialize_secrets_inplace
 from pymilvus import (
     AnnSearchRequest,
-    Collection,
     CollectionSchema,
     DataType,
     FieldSchema,
     MilvusClient,
     MilvusException,
     RRFRanker,
-    connections,
 )
 from pymilvus.client.abstract import BaseRanker
 from pymilvus.client.types import LoadState
@@ -198,13 +197,9 @@ class MilvusDocumentStore:
         self.connection_args = resolved_args
         self._milvus_client = MilvusClient(**resolved_args)
         self.alias = self.client._using
-        # Since pymilvus 2.6.x, MilvusClient no longer registers its connection
-        # with the ORM `connections` registry; register its handler so the ORM
-        # `Collection` exposed by `self.col` can find the connection.
-        if hasattr(connections, "_alias_handlers"):
-            connections._alias_handlers.setdefault(self.alias, self.client._get_connection())
-        self._col_cache: Optional[Collection] = None
+        self._col_cache: Optional[Any] = None
         self._cache_key: Optional[str] = None
+        self._collection_known_to_exist = False
 
         # Apply properties to the existing collection if it exists
         if self.client.has_collection(self.collection_name):
@@ -246,20 +241,43 @@ class MilvusDocumentStore:
         return self._milvus_client
 
     @property
-    def col(self) -> Optional[Collection]:
-        """The ORM Collection object, or None if the collection does not exist.
+    def col(self) -> Optional[Any]:
+        """The ORM `pymilvus.Collection` object, or None if the collection does not exist.
 
-        Kept for backward compatibility with code that accesses `store.col`;
-        internal operations use the `MilvusClient` API via `self.client`.
+        Deprecated: use `self.client` (a `MilvusClient`) instead. The ORM API is removed in pymilvus 3.1,
+        where accessing this property raises `MilvusStoreError`.
         """
+        warnings.warn(
+            "`MilvusDocumentStore.col` is deprecated because pymilvus 3.1 removes the ORM `Collection` API. "
+            "Use `MilvusDocumentStore.client` (a `MilvusClient`) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        try:
+            # Imported lazily: pymilvus 3.1 removes the ORM API, and nothing else needs it.
+            from pymilvus import Collection, connections  # noqa: PLC0415
+        except ImportError as err:
+            msg = "`MilvusDocumentStore.col` is unavailable with this pymilvus version; use `.client` instead."
+            raise MilvusStoreError(msg) from err
+
         current_key = f"{self.collection_name}:{self.alias}"
         if self._cache_key == current_key and self._col_cache is not None:
             return self._col_cache
-        if self.client.has_collection(self.collection_name):
+        if self._collection_exists():
+            # Since pymilvus 2.6.x, MilvusClient no longer registers its connection with the ORM
+            # `connections` registry; register its handler so `Collection` can find the connection.
+            if hasattr(connections, "_alias_handlers"):
+                connections._alias_handlers.setdefault(self.alias, self.client._get_connection())
             self._col_cache = Collection(self.collection_name, using=self.alias)
             self._cache_key = current_key
             return self._col_cache
         return None
+
+    def _collection_exists(self) -> bool:
+        # Cache only a positive result: a missing collection gets created later by `write_documents`.
+        if not self._collection_known_to_exist:
+            self._collection_known_to_exist = self.client.has_collection(self.collection_name)
+        return self._collection_known_to_exist
 
     def _drop_collection(self) -> None:
         self.client.drop_collection(self.collection_name)
@@ -271,6 +289,7 @@ class MilvusDocumentStore:
             conn.schema_cache.pop(self.collection_name, None)
         self._col_cache = None
         self._cache_key = None
+        self._collection_known_to_exist = False
 
     def count_documents(self) -> int:
         """
@@ -278,7 +297,7 @@ class MilvusDocumentStore:
 
         :return: The number of documents in the document store.
         """
-        if self.col is None:
+        if not self._collection_exists():
             logger.debug("No existing collection to count.")
             return 0
         count_expr = "count(*)"
@@ -357,7 +376,7 @@ class MilvusDocumentStore:
         :param filters: The filters to apply to the document list.
         :return: A list of Documents that match the given filters.
         """
-        if self.col is None:
+        if not self._collection_exists():
             logger.debug("No existing collection to filter.")
             return []
         output_fields = self._get_output_fields()
@@ -458,7 +477,7 @@ class MilvusDocumentStore:
             return 0
 
         # If the collection hasn't been initialized yet, perform all steps to do so
-        if self.col is None:
+        if not self._collection_exists():
             self._init(embeddings=embeddings, metas=metas, timeout=self.timeout)
 
         insert_list: list[dict] = []
@@ -486,7 +505,7 @@ class MilvusDocumentStore:
         total_count = len(insert_list)
         batch_size = 1000
         wrote_ids = []
-        if self.col is None:
+        if not self._collection_exists():
             raise MilvusException(message="Collection is not initialized")
         for i in range(0, total_count, batch_size):
             # Grab end index
@@ -507,7 +526,7 @@ class MilvusDocumentStore:
 
         :param document_ids: The object_ids to delete
         """
-        if self.col is None:
+        if not self._collection_exists():
             logger.debug("No existing collection to delete.")
             return None
         expr = "id in ['" + "','".join(document_ids) + "']"
@@ -650,14 +669,14 @@ class MilvusDocumentStore:
 
     def _extract_fields(self) -> None:
         """Grab the existing fields from the Collection"""
-        if self.col is not None:
+        if self._collection_exists():
             schema_info = self.client.describe_collection(self.collection_name)
             for x in schema_info["fields"]:
                 self.fields.append(x["name"])
 
     def _create_index(self) -> None:
         """Create an index on the collection"""
-        if self.col is not None and self._get_index() is None:
+        if self._collection_exists() and self._get_index() is None:
             try:
                 # If no index params, use a default AUTOINDEX based one
                 if self.index_params is None:
@@ -712,31 +731,28 @@ class MilvusDocumentStore:
 
     def _create_search_params(self) -> None:
         """Generate search params based on the current index type"""
-        if self.col is not None and self.search_params is None:
+        if self._collection_exists() and self.search_params is None:
             index = self._get_index()
             if index is not None:
-                index_type: str = index["index_param"]["index_type"]
-                metric_type: str = index["index_param"]["metric_type"]
+                index_type: str = index["index_type"]
+                metric_type: str = index["metric_type"]
                 self.search_params = self.default_search_params[index_type]  # {"metric_type": "L2", "params": {}}
                 self.search_params["metric_type"] = metric_type
 
     def _get_index(self) -> Optional[Dict[str, Any]]:
         """Return the vector index information if it exists"""
-        # `MilvusClient.describe_index` raises when the field has no index yet,
-        # so keep the ORM index iteration here: it simply yields nothing on the
-        # first-time index creation path.
-        col = self.col
-        if col is not None:
-            for x in col.indexes:
-                if x.field_name == self._vector_field:
-                    return x.to_dict()
-        return None
+        if not self._collection_exists():
+            return None
+        # `describe_index` raises when the field has no index, but `list_indexes` returns an empty list.
+        index_names = self.client.list_indexes(self.collection_name, field_name=self._vector_field)
+        if not index_names:
+            return None
+        return self.client.describe_index(self.collection_name, index_names[0])
 
     def _load(self, timeout: Optional[float] = None) -> None:
         """Load the collection if available."""
         if (
-            self.col is not None
-            and self._get_index() is not None
+            self._get_index() is not None
             and self.client.get_load_state(self.collection_name)["state"] == LoadState.NotLoad
         ):
             if self.partition_names:
@@ -774,7 +790,7 @@ class MilvusDocumentStore:
         query_text: Optional[str] = None,
     ) -> List[Document]:
         """Dense embedding retrieval"""
-        if self.col is None:
+        if not self._collection_exists():
             logger.debug("No existing collection to search.")
             return []
 
@@ -813,7 +829,7 @@ class MilvusDocumentStore:
         query_text: Optional[str] = None,
     ) -> List[Document]:
         """Sparse embedding retrieval"""
-        if self.col is None:
+        if not self._collection_exists():
             logger.debug("No existing collection to search.")
             return []
         if self._sparse_vector_field is None:
@@ -867,7 +883,7 @@ class MilvusDocumentStore:
         query_text: Optional[str] = None,
     ) -> List[Document]:
         """Hybrid retrieval using both dense and sparse embeddings"""
-        if self.col is None:
+        if not self._collection_exists():
             logger.debug("No existing collection to search.")
             return []
         if self._sparse_vector_field is None:
